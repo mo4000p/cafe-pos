@@ -12,6 +12,7 @@ const {
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_FROM_NUMBER,
+  SENDGRID_API_KEY,
   PORT = 3000,
   HOST = '0.0.0.0',
 } = process.env;
@@ -39,7 +40,7 @@ const app = Fastify({ logger: true });
 await app.register(fastifyFormBody);
 await app.register(fastifyWs);
 
-// Route 1: Twilio calls this when the phone rings (for OpenAI Realtime bot)
+// Route 1: Twilio calls this when the phone rings
 app.post('/incoming-call', async (req, reply) => {
   const callSid     = req.body.CallSid;
   const callerPhone = req.body.From;
@@ -138,7 +139,7 @@ app.get('/media-stream', { websocket: true }, (twilioWs, req) => {
   twilioWs.on('close', () => { openaiWs.close(); });
 });
 
-// Route 3: Called directly from existing Twilio Function after order is spoken
+// Route 3: Called from Twilio Function after order is spoken
 app.post('/charge', async (req, reply) => {
   const { callerPhone, callSid, items, total_cents } = req.body;
   app.log.info({ callerPhone, total_cents }, 'Charge request from Twilio Function');
@@ -187,6 +188,11 @@ async function chargePhone(phone, callSid, order) {
     });
 
     app.log.info({ phone, intentId: intent.id }, 'Payment charged');
+
+    // Send email to kitchen
+    await sendKitchenEmail(order, intent.id, phone);
+
+    // Send SMS receipt to customer
     await sendSmsReceipt(phone, order, intent.id);
 
     return {
@@ -201,7 +207,41 @@ async function chargePhone(phone, callSid, order) {
   }
 }
 
-// SMS receipt
+// Email to kitchen via SendGrid
+async function sendKitchenEmail(order, intentId, phone) {
+  const itemLines = (order.items || [])
+    .map(i => `${i.quantity}x ${i.name} — $${((i.price * i.quantity) / 100).toFixed(2)}`)
+    .join('\n');
+
+  const emailBody = `NEW ORDER\n\n${itemLines}\n\nTotal: $${(order.total_cents / 100).toFixed(2)}\nPhone: ${phone}\nRef: ${intentId.slice(-8).toUpperCase()}`;
+
+  try {
+    const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${SENDGRID_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        personalizations: [{ to: [{ email: 'mo40000p@gmail.com' }] }],
+        from: { email: 'orders@svoice.shop', name: 'Cafe Orders' },
+        subject: `New Order — $${(order.total_cents / 100).toFixed(2)}`,
+        content: [{ type: 'text/plain', value: emailBody }],
+      }),
+    });
+
+    if (response.ok) {
+      app.log.info('Kitchen email sent');
+    } else {
+      const err = await response.text();
+      app.log.error({ err }, 'Kitchen email failed');
+    }
+  } catch (err) {
+    app.log.error({ err: err.message }, 'Kitchen email error');
+  }
+}
+
+// SMS receipt to customer
 async function sendSmsReceipt(to, order, intentId) {
   const lines = (order.items||[]).map(i =>
     `  ${i.name} x${i.quantity}  $${((i.price * i.quantity) / 100).toFixed(2)}`
