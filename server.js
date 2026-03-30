@@ -31,6 +31,7 @@ const MENU = [
   { name: 'Croissant',       price: 400  },
   { name: 'Granola Bowl',    price: 750  },
   { name: 'BLT Sandwich',    price: 1050 },
+  { name: 'Test',            price: 5    },
 ];
 
 const MENU_TEXT = MENU.map(i => `${i.name} $${(i.price/100).toFixed(2)}`).join(', ');
