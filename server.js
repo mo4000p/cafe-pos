@@ -148,32 +148,17 @@ app.post('/charge', async (req, reply) => {
 });
 
 // Route 4: Called from Twilio Pay after card is collected
+// Twilio Pay already charged the card — we just send the kitchen email
 app.post('/charge-token', async (req, reply) => {
   const { callerPhone, callSid, paymentToken, items, total_cents } = req.body;
   app.log.info({ callerPhone, total_cents }, 'Charge token request');
 
   try {
-    const paymentMethod = await stripe.paymentMethods.create({
-      type: 'card',
-      card: { token: paymentToken },
-    });
-
-    const intent = await stripe.paymentIntents.create({
-      amount: total_cents,
-      currency: 'usd',
-      payment_method: paymentMethod.id,
-      confirm: true,
-      off_session: true,
-      description: `Phone order — ${(items||[]).map(i => `${i.name}x${i.quantity}`).join(', ')}`,
-      metadata: { callSid: callSid || 'unknown', source: 'twilio-pay' },
-    });
-
-    app.log.info({ intentId: intent.id }, 'Token payment charged');
-    await sendKitchenEmail({ items, total_cents }, intent.id, callerPhone);
-
+    app.log.info({ paymentToken }, 'Payment confirmed by Twilio Pay');
+    await sendKitchenEmail({ items, total_cents }, paymentToken, callerPhone);
     reply.send({ success: true, charged: `$${(total_cents / 100).toFixed(2)}` });
   } catch (err) {
-    app.log.error({ err: err.message }, 'Token charge failed');
+    app.log.error({ err: err.message }, 'Kitchen email failed');
     reply.send({ success: false, error: err.message });
   }
 });
