@@ -147,6 +147,37 @@ app.post('/charge', async (req, reply) => {
   reply.send(result);
 });
 
+// Route 4: Called from Twilio Pay after card is collected
+app.post('/charge-token', async (req, reply) => {
+  const { callerPhone, callSid, paymentToken, items, total_cents } = req.body;
+  app.log.info({ callerPhone, total_cents }, 'Charge token request');
+
+  try {
+    const paymentMethod = await stripe.paymentMethods.create({
+      type: 'card',
+      card: { token: paymentToken },
+    });
+
+    const intent = await stripe.paymentIntents.create({
+      amount: total_cents,
+      currency: 'usd',
+      payment_method: paymentMethod.id,
+      confirm: true,
+      off_session: true,
+      description: `Phone order — ${(items||[]).map(i => `${i.name}x${i.quantity}`).join(', ')}`,
+      metadata: { callSid: callSid || 'unknown', source: 'twilio-pay' },
+    });
+
+    app.log.info({ intentId: intent.id }, 'Token payment charged');
+    await sendKitchenEmail({ items, total_cents }, intent.id, callerPhone);
+
+    reply.send({ success: true, charged: `$${(total_cents / 100).toFixed(2)}` });
+  } catch (err) {
+    app.log.error({ err: err.message }, 'Token charge failed');
+    reply.send({ success: false, error: err.message });
+  }
+});
+
 // Health check
 app.get('/health', async () => ({ status: 'ok', calls: calls.size }));
 
@@ -188,11 +219,7 @@ async function chargePhone(phone, callSid, order) {
     });
 
     app.log.info({ phone, intentId: intent.id }, 'Payment charged');
-
-    // Send email to kitchen
     await sendKitchenEmail(order, intent.id, phone);
-
-    // Send SMS receipt to customer
     await sendSmsReceipt(phone, order, intent.id);
 
     return {
