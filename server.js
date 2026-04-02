@@ -21,17 +21,16 @@ const stripe = new Stripe(STRIPE_SECRET_KEY);
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
 const MENU = [
-  { name: 'Espresso',        price: 350  },
-  { name: 'Cappuccino',      price: 450  },
-  { name: 'Flat White',      price: 475  },
-  { name: 'Cold Brew',       price: 500  },
-  { name: 'Green Tea',       price: 375  },
-  { name: 'Chai Latte',      price: 425  },
-  { name: 'Avocado Toast',   price: 950  },
-  { name: 'Croissant',       price: 400  },
-  { name: 'Granola Bowl',    price: 750  },
-  { name: 'BLT Sandwich',    price: 1050 },
-  { name: 'Test',            price: 50   },
+  { name: 'Espresso',      price: 50 },
+  { name: 'Cappuccino',    price: 50 },
+  { name: 'Flat White',    price: 50 },
+  { name: 'Cold Brew',     price: 50 },
+  { name: 'Green Tea',     price: 50 },
+  { name: 'Chai Latte',    price: 50 },
+  { name: 'Avocado Toast', price: 50 },
+  { name: 'Croissant',     price: 50 },
+  { name: 'Granola Bowl',  price: 50 },
+  { name: 'BLT Sandwich',  price: 50 },
 ];
 
 const MENU_TEXT = MENU.map(i => `${i.name} $${(i.price/100).toFixed(2)}`).join(', ');
