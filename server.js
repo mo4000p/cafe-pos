@@ -221,11 +221,51 @@ async function chargePhone(phone, callSid, order) {
 
 // Email to kitchen via SendGrid
 async function sendKitchenEmail(order, intentId, phone) {
-  const itemLines = (order.items || [])
-    .map(i => `${i.quantity}x ${i.name} — $${((i.price * i.quantity) / 100).toFixed(2)}`)
-    .join('\n');
+  const itemRows = (order.items || [])
+    .map(i => `
+      <tr>
+        <td style="padding:6px 12px;">${i.quantity}x ${i.name}</td>
+        <td style="padding:6px 12px;text-align:right;">$${((i.price * i.quantity) / 100).toFixed(2)}</td>
+      </tr>`)
+    .join('');
 
-  const emailBody = `NEW ORDER\n\n${itemLines}\n\nTotal: $${(order.total_cents / 100).toFixed(2)}\nPhone: ${phone}\nRef: ${intentId.slice(-8).toUpperCase()}`;
+  const ref = intentId.slice(-8).toUpperCase();
+  const total = `$${(order.total_cents / 100).toFixed(2)}`;
+
+  const htmlBody = `
+<!DOCTYPE html>
+<html>
+<body style="font-family:Arial,sans-serif;background:#f4f4f4;margin:0;padding:20px;">
+  <div style="max-width:480px;margin:0 auto;background:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.1);">
+    <div style="background:#e8590c;padding:20px 24px;">
+      <h1 style="margin:0;color:#ffffff;font-size:22px;">🧾 New Order — ${total}</h1>
+    </div>
+    <div style="padding:24px;">
+      <table style="width:100%;border-collapse:collapse;">
+        <thead>
+          <tr style="border-bottom:2px solid #e8590c;">
+            <th style="text-align:left;padding:6px 12px;color:#555;">Item</th>
+            <th style="text-align:right;padding:6px 12px;color:#555;">Price</th>
+          </tr>
+        </thead>
+        <tbody>${itemRows}</tbody>
+        <tfoot>
+          <tr style="border-top:2px solid #e8590c;font-weight:bold;">
+            <td style="padding:10px 12px;">Total</td>
+            <td style="padding:10px 12px;text-align:right;">${total}</td>
+          </tr>
+        </tfoot>
+      </table>
+      <div style="margin-top:20px;padding:12px;background:#f9f9f9;border-radius:6px;font-size:14px;color:#444;">
+        <div><strong>Phone:</strong> ${phone}</div>
+        <div><strong>Ref:</strong> ${ref}</div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>`;
+
+  const plainBody = `NEW ORDER\n\n${(order.items||[]).map(i => `${i.quantity}x ${i.name} — $${((i.price*i.quantity)/100).toFixed(2)}`).join('\n')}\n\nTotal: ${total}\nPhone: ${phone}\nRef: ${ref}`;
 
   try {
     const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
@@ -237,8 +277,12 @@ async function sendKitchenEmail(order, intentId, phone) {
       body: JSON.stringify({
         personalizations: [{ to: [{ email: 'mo40000p@gmail.com' }] }],
         from: { email: 'orders@svoice.shop', name: 'Cafe Orders' },
-        subject: `New Order — $${(order.total_cents / 100).toFixed(2)}`,
-        content: [{ type: 'text/plain', value: emailBody }],
+        reply_to: { email: 'mo40000p@gmail.com' },
+        subject: `🧾 New Order — ${total}`,
+        content: [
+          { type: 'text/plain', value: plainBody },
+          { type: 'text/html',  value: htmlBody },
+        ],
       }),
     });
 
