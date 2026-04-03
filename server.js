@@ -36,6 +36,28 @@ const MENU = [
 const MENU_TEXT = MENU.map(i => `${i.name} $${(i.price/100).toFixed(2)}`).join(', ');
 const calls = new Map();
 
+// ── Store hours ──────────────────────────────────────────────────────────────
+// Set at installation via Railway env vars:
+//   STORE_OPEN_HOUR=7             (default 7am)
+//   STORE_CLOSE_HOUR=22           (default 10pm)
+//   STORE_TIMEZONE=America/Chicago (default Central)
+//   STORE_OPEN=true/false         (manual override)
+function isStoreOpen() {
+  const override = process.env.STORE_OPEN;
+  if (override === 'true')  return true;
+  if (override === 'false') return false;
+
+  const timezone  = process.env.STORE_TIMEZONE  ?? 'America/Chicago';
+  const openHour  = parseInt(process.env.STORE_OPEN_HOUR  ?? '7');
+  const closeHour = parseInt(process.env.STORE_CLOSE_HOUR ?? '22');
+
+  const now        = new Date();
+  const local      = new Date(now.toLocaleString('en-US', { timeZone: timezone }));
+  const nowMinutes = local.getHours() * 60 + local.getMinutes();
+
+  return nowMinutes >= openHour * 60 && nowMinutes < closeHour * 60;
+}
+
 const app = Fastify({ logger: true });
 await app.register(fastifyFormBody);
 await app.register(fastifyWs);
@@ -44,8 +66,20 @@ await app.register(fastifyWs);
 app.post('/incoming-call', async (req, reply) => {
   const callSid     = req.body.CallSid;
   const callerPhone = req.body.From;
-  calls.set(callSid, { callerPhone, order: null, charged: false });
   app.log.info({ callSid, callerPhone }, 'Incoming call');
+
+  // ── Closed? Play message and hang up ────────────────────────────────────
+  if (!isStoreOpen()) {
+    app.log.info({ callSid }, 'Store closed — rejecting call');
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Joanna">Sorry, we are currently closed. Our hours are 7 AM to 10 PM daily. Please call back during business hours. Goodbye!</Say>
+  <Hangup/>
+</Response>`;
+    return reply.type('text/xml').send(twiml);
+  }
+
+  calls.set(callSid, { callerPhone, order: null, charged: false });
   const host = req.headers.host;
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
