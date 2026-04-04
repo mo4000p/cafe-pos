@@ -21,27 +21,33 @@ const stripe = new Stripe(STRIPE_SECRET_KEY);
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
 const MENU = [
-  { name: 'Espresso',      price: 50 },
-  { name: 'Cappuccino',    price: 50 },
-  { name: 'Flat White',    price: 50 },
-  { name: 'Cold Brew',     price: 50 },
-  { name: 'Green Tea',     price: 50 },
-  { name: 'Chai Latte',    price: 50 },
-  { name: 'Avocado Toast', price: 50 },
-  { name: 'Croissant',     price: 50 },
-  { name: 'Granola Bowl',  price: 50 },
-  { name: 'BLT Sandwich',  price: 50 },
+  { name: 'Small Pizza',          price: 10 },
+  { name: 'Medium Pizza',         price: 10 },
+  { name: 'Large Pizza',          price: 10 },
+  { name: 'One Pizza Family Deal',price: 10 },
+  { name: 'Two Pizza Family Deal',price: 10 },
+  { name: 'Small Coke',           price: 10 },
+  { name: 'Medium Coke',          price: 10 },
+  { name: 'Large Coke',           price: 10 },
+  { name: 'Small Sprite',         price: 10 },
+  { name: 'Medium Sprite',        price: 10 },
+  { name: 'Large Sprite',         price: 10 },
+  { name: 'Small Mountain Dew',   price: 10 },
+  { name: 'Medium Mountain Dew',  price: 10 },
+  { name: 'Large Mountain Dew',   price: 10 },
+  { name: 'House Salad',          price: 10 },
+  { name: 'Extra Dressing',       price: 10 },
+  { name: 'Extra Cheese',         price: 10 },
+  { name: 'Pepperoni',            price: 10 },
+  { name: 'Sausage',              price: 10 },
+  { name: 'Onion',                price: 10 },
+  { name: 'Mushroom',             price: 10 },
 ];
 
 const MENU_TEXT = MENU.map(i => `${i.name} $${(i.price/100).toFixed(2)}`).join(', ');
 const calls = new Map();
 
 // ── Store hours ──────────────────────────────────────────────────────────────
-// Set at installation via Railway env vars:
-//   STORE_OPEN_HOUR=7             (default 7am)
-//   STORE_CLOSE_HOUR=22           (default 10pm)
-//   STORE_TIMEZONE=America/Chicago (default Central)
-//   STORE_OPEN=true/false         (manual override)
 function isStoreOpen() {
   const override = process.env.STORE_OPEN;
   if (override === 'true')  return true;
@@ -68,7 +74,6 @@ app.post('/incoming-call', async (req, reply) => {
   const callerPhone = req.body.From;
   app.log.info({ callSid, callerPhone }, 'Incoming call');
 
-  // ── Closed? Play message and hang up ────────────────────────────────────
   if (!isStoreOpen()) {
     app.log.info({ callSid }, 'Store closed — rejecting call');
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -98,14 +103,19 @@ app.get('/media-stream', { websocket: true }, (twilioWs, req) => {
   const SESSION_CONFIG = {
     model: 'gpt-4o-realtime-preview',
     voice: 'alloy',
-    instructions: `You are a friendly phone order-taker for a cafe. Greet the caller, take their order from this menu: ${MENU_TEXT}. Confirm the order and total, then call the place_order function. Be concise.`,
+    instructions: `You are a friendly phone order-taker for a pizza restaurant. 
+Greet the caller and mention the One Pizza Family Deal and Two Pizza Family Deal are each $0.10. 
+Take their complete order from this menu: ${MENU_TEXT}. 
+Available toppings: Extra Cheese, Pepperoni, Sausage, Onion, Mushroom — all $0.10 each.
+Always ask "What would you like to order? Please say your complete order including toppings."
+Confirm the full order including toppings and total, then call the place_order function. Be concise.`,
     input_audio_transcription: { model: 'whisper-1' },
     turn_detection: { type: 'server_vad', threshold: 0.5, silence_duration_ms: 700 },
     tools: [
       {
         type: 'function',
         name: 'place_order',
-        description: 'Call this when the customer has confirmed their order.',
+        description: 'Call this when the customer has confirmed their complete order including toppings.',
         parameters: {
           type: 'object',
           properties: {
@@ -182,7 +192,6 @@ app.post('/charge', async (req, reply) => {
 });
 
 // Route 4: Called from Twilio Pay after card is collected
-// Twilio Pay already charged the card — we just send the kitchen email
 app.post('/charge-token', async (req, reply) => {
   const { callerPhone, callSid, paymentToken, items, total_cents } = req.body;
   app.log.info({ callerPhone, total_cents }, 'Charge token request');
@@ -233,7 +242,7 @@ async function chargePhone(phone, callSid, order) {
       payment_method: pm.id,
       confirm: true,
       off_session: true,
-      description: `Phone order — ${(order.items||[]).map(i => `${i.name}x${i.quantity}`).join(', ')}`,
+      description: `Pizza order — ${(order.items||[]).map(i => `${i.name}x${i.quantity}`).join(', ')}`,
       metadata: { callSid: callSid || 'unknown', source: 'twilio-voice-bot' },
     });
 
@@ -272,7 +281,7 @@ async function sendKitchenEmail(order, intentId, phone) {
 <body style="font-family:Arial,sans-serif;background:#f4f4f4;margin:0;padding:20px;">
   <div style="max-width:480px;margin:0 auto;background:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.1);">
     <div style="background:#e8590c;padding:20px 24px;">
-      <h1 style="margin:0;color:#ffffff;font-size:22px;">🧾 New Order — ${total}</h1>
+      <h1 style="margin:0;color:#ffffff;font-size:22px;">🍕 New Pizza Order — ${total}</h1>
     </div>
     <div style="padding:24px;">
       <table style="width:100%;border-collapse:collapse;">
@@ -299,7 +308,7 @@ async function sendKitchenEmail(order, intentId, phone) {
 </body>
 </html>`;
 
-  const plainBody = `NEW ORDER\n\n${(order.items||[]).map(i => `${i.quantity}x ${i.name} — $${((i.price*i.quantity)/100).toFixed(2)}`).join('\n')}\n\nTotal: ${total}\nPhone: ${phone}\nRef: ${ref}`;
+  const plainBody = `NEW PIZZA ORDER\n\n${(order.items||[]).map(i => `${i.quantity}x ${i.name} — $${((i.price*i.quantity)/100).toFixed(2)}`).join('\n')}\n\nTotal: ${total}\nPhone: ${phone}\nRef: ${ref}`;
 
   try {
     const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
@@ -310,9 +319,9 @@ async function sendKitchenEmail(order, intentId, phone) {
       },
       body: JSON.stringify({
         personalizations: [{ to: [{ email: 'mo40000p@gmail.com' }] }],
-        from: { email: 'orders@svoice.shop', name: 'Cafe Orders' },
+        from: { email: 'orders@svoice.shop', name: 'Pizza Orders' },
         reply_to: { email: 'mo40000p@gmail.com' },
-        subject: `🧾 New Order — ${total}`,
+        subject: `🍕 New Pizza Order — ${total}`,
         content: [
           { type: 'text/plain', value: plainBody },
           { type: 'text/html',  value: htmlBody },
@@ -337,7 +346,7 @@ async function sendSmsReceipt(to, order, intentId) {
     `  ${i.name} x${i.quantity}  $${((i.price * i.quantity) / 100).toFixed(2)}`
   );
   const body = [
-    'Thanks for your order!',
+    'Thanks for your pizza order!',
     ...lines,
     `Total: $${(order.total_cents / 100).toFixed(2)}`,
     `Ref: ${intentId.slice(-8).toUpperCase()}`,
