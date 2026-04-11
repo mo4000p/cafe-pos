@@ -47,7 +47,7 @@ const MENU = [
 const MENU_TEXT = MENU.map(i => `${i.name} $${(i.price/100).toFixed(2)}`).join(', ');
 const calls = new Map();
 
-// ── Store hours ──────────────────────────────────────────────────────────────
+// ── Store hours ───────────────────────────────────────────────────────────────
 function isStoreOpen() {
   const override = process.env.STORE_OPEN;
   if (override === 'true')  return true;
@@ -84,12 +84,16 @@ app.post('/incoming-call', async (req, reply) => {
     return reply.type('text/xml').send(twiml);
   }
 
+  // Store caller info — callSid will be confirmed again from the stream start event
   calls.set(callSid, { callerPhone, order: null, charged: false });
+
   const host = req.headers.host;
+  // NOTE: We no longer rely on the query param for callSid in the websocket handler.
+  // It's kept here only as a fallback hint — the real callSid comes from msg.start.callSid.
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="wss://${host}/media-stream?callSid=${callSid}" />
+    <Stream url="wss://${host}/media-stream" />
   </Connect>
 </Response>`;
   reply.type('text/xml').send(twiml);
@@ -97,8 +101,7 @@ app.post('/incoming-call', async (req, reply) => {
 
 // Route 2: Bidirectional media stream (Twilio <-> OpenAI Realtime)
 app.get('/media-stream', { websocket: true }, (twilioWs, req) => {
-  const callSid = new URL(req.url, 'http://x').searchParams.get('callSid');
-  app.log.info({ callSid }, 'Media stream connected');
+  app.log.info('Media stream connected — waiting for start event to get callSid');
 
   const SESSION_CONFIG = {
     model: 'gpt-4o-realtime-preview',
@@ -107,7 +110,9 @@ app.get('/media-stream', { websocket: true }, (twilioWs, req) => {
 Greet the caller and mention the One Pizza Family Deal and Two Pizza Family Deal are each $0.10. 
 Take their complete order from this menu: ${MENU_TEXT}. 
 Available toppings: Extra Cheese, Pepperoni, Sausage, Onion, Mushroom — all $0.10 each.
-Always ask "What would you like to order? Please say your complete order including toppings."
+Always ask "What would you like to order? Please say your complete order including size and toppings."
+IMPORTANT: If the customer orders a pizza without saying small, medium, or large — ask for the size before confirming.
+If the customer orders a pop (Coke, Sprite, Mountain Dew) without saying small, medium, or large — ask for the size before confirming.
 Confirm the full order including toppings and total, then call the place_order function. Be concise.`,
     input_audio_transcription: { model: 'whisper-1' },
     turn_detection: { type: 'server_vad', threshold: 0.5, silence_duration_ms: 700 },
@@ -147,6 +152,7 @@ Confirm the full order including toppings and total, then call the place_order f
   );
 
   let streamSid = null;
+  let callSid   = null;  // Set from the Twilio 'start' event — reliable even behind Railway proxy
 
   openaiWs.on('open', () => {
     openaiWs.send(JSON.stringify({ type: 'session.update', session: SESSION_CONFIG }));
@@ -173,7 +179,19 @@ Confirm the full order including toppings and total, then call the place_order f
 
   twilioWs.on('message', (raw) => {
     const msg = JSON.parse(raw);
-    if (msg.event === 'start') streamSid = msg.start.streamSid;
+
+    if (msg.event === 'start') {
+      // THIS is the reliable source of callSid — comes from Twilio in the stream body
+      streamSid = msg.start.streamSid;
+      callSid   = msg.start.callSid;
+      app.log.info({ callSid, streamSid }, 'Stream started — callSid confirmed');
+
+      // If /incoming-call stored the call under a different key, re-key it
+      if (callSid && !calls.has(callSid)) {
+        app.log.warn({ callSid }, 'callSid not in map — call may have arrived out of order');
+      }
+    }
+
     if (msg.event === 'media') {
       openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: msg.media.payload }));
     }
