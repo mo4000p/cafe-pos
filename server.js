@@ -84,12 +84,9 @@ app.post('/incoming-call', async (req, reply) => {
     return reply.type('text/xml').send(twiml);
   }
 
-  // Store caller info — callSid will be confirmed again from the stream start event
   calls.set(callSid, { callerPhone, order: null, charged: false });
 
   const host = req.headers.host;
-  // NOTE: We no longer rely on the query param for callSid in the websocket handler.
-  // It's kept here only as a fallback hint — the real callSid comes from msg.start.callSid.
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -152,7 +149,7 @@ Confirm the full order including toppings and total, then call the place_order f
   );
 
   let streamSid = null;
-  let callSid   = null;  // Set from the Twilio 'start' event — reliable even behind Railway proxy
+  let callSid   = null;
 
   openaiWs.on('open', () => {
     openaiWs.send(JSON.stringify({ type: 'session.update', session: SESSION_CONFIG }));
@@ -181,12 +178,10 @@ Confirm the full order including toppings and total, then call the place_order f
     const msg = JSON.parse(raw);
 
     if (msg.event === 'start') {
-      // THIS is the reliable source of callSid — comes from Twilio in the stream body
       streamSid = msg.start.streamSid;
       callSid   = msg.start.callSid;
       app.log.info({ callSid, streamSid }, 'Stream started — callSid confirmed');
 
-      // If /incoming-call stored the call under a different key, re-key it
       if (callSid && !calls.has(callSid)) {
         app.log.warn({ callSid }, 'callSid not in map — call may have arrived out of order');
       }
@@ -211,13 +206,17 @@ app.post('/charge', async (req, reply) => {
 
 // Route 4: Called from Twilio Pay after card is collected
 app.post('/charge-token', async (req, reply) => {
-  const { callerPhone, callSid, paymentToken, items, total_cents } = req.body;
-  app.log.info({ callerPhone, total_cents }, 'Charge token request');
+  const { token, order, amount } = req.body;
+  app.log.info({ amount }, 'Charge token request');
 
   try {
-    app.log.info({ paymentToken }, 'Payment confirmed by Twilio Pay');
-    await sendKitchenEmail({ items, total_cents }, paymentToken, callerPhone);
-    reply.send({ success: true, charged: `$${(total_cents / 100).toFixed(2)}` });
+    app.log.info({ token }, 'Payment confirmed by Twilio Pay');
+
+    // order may arrive as a JSON string or already-parsed object
+    const orderData = typeof order === 'string' ? JSON.parse(order) : order;
+
+    await sendKitchenEmail(orderData, token, 'Phone order');
+    reply.send({ success: true, charged: `$${(orderData.total_cents / 100).toFixed(2)}` });
   } catch (err) {
     app.log.error({ err: err.message }, 'Kitchen email failed');
     reply.send({ success: false, error: err.message });
@@ -290,7 +289,7 @@ async function sendKitchenEmail(order, intentId, phone) {
       </tr>`)
     .join('');
 
-  const ref = intentId.slice(-8).toUpperCase();
+  const ref = String(intentId).slice(-8).toUpperCase();
   const total = `$${(order.total_cents / 100).toFixed(2)}`;
 
   const htmlBody = `
