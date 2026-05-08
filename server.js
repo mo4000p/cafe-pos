@@ -8,8 +8,8 @@ import 'dotenv/config';
 const {
   OPENAI_API_KEY,
   STRIPE_SECRET_KEY,
-  TELNYX_API_KEY,
-  TELNYX_FROM_NUMBER,
+  TELNYX_API_KEY,       // for SMS only
+  TELNYX_FROM_NUMBER,   // Telnyx number for outbound SMS (or keep TWILIO_FROM_NUMBER if porting later)
   SENDGRID_API_KEY,
   PORT = 3000,
   HOST = '0.0.0.0',
@@ -85,56 +85,35 @@ const app = Fastify({ logger: true });
 await app.register(fastifyFormBody);
 await app.register(fastifyWs);
 
-// ── Route 1: Telnyx calls this when the phone rings ──────────────────────────
-// In your Telnyx Mission Control portal, set the webhook URL to:
+// ── Route 1: Twilio calls this when the phone rings ──────────────────────────
+// In Twilio console → Phone Numbers → (361) 315-8772 → set webhook to:
 //   https://cafe-pos-production-d0bd.up.railway.app/incoming-call
-// Telnyx sends JSON (not form-encoded) for call.initiated events.
 app.post('/incoming-call', async (req, reply) => {
-  const body = req.body;
+  const callSid     = req.body.CallSid;
+  const callerPhone = req.body.From;
 
-  // Telnyx wraps everything in a "data" object
-  const event = body?.data;
-  const callControlId = event?.payload?.call_control_id;
-  const callerPhone   = event?.payload?.from;
-  const callSid       = callControlId; // use call_control_id as our internal key
-
-  app.log.info({ callControlId, callerPhone }, 'Incoming call');
+  app.log.info({ callSid, callerPhone }, 'Incoming call');
 
   if (!isStoreOpen()) {
-    app.log.info({ callControlId }, 'Store closed — hanging up');
-
-    // Tell Telnyx to speak and hang up via Call Control API
-    await fetch(`https://api.telnyx.com/v2/calls/${callControlId}/actions/speak`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${TELNYX_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        payload: 'Sorry, we are currently closed. Our hours are 7 AM to 10 PM daily. Please call back during business hours. Goodbye!',
-        voice: 'female',
-        language: 'en-US',
-        command_id: 'closed-msg',
-      }),
-    });
-
-    return reply.code(200).send({ message: 'ok' });
+    app.log.info({ callSid }, 'Store closed — rejecting call');
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">Sorry, we are currently closed. Our hours are 7 AM to 10 PM daily. Please call back during business hours. Goodbye!</Say>
+  <Hangup/>
+</Response>`;
+    return reply.type('text/xml').send(twiml);
   }
 
   calls.set(callSid, { callerPhone, order: null, charged: false });
 
-  const host = `cafe-pos-production-d0bd.up.railway.app`;
-
-  // Telnyx TeXML — identical structure to TwiML
-  const texml = `<?xml version="1.0" encoding="UTF-8"?>
+  const host = req.headers.host;
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <Stream url="wss://${host}/media-stream" />
   </Connect>
 </Response>`;
-
-  // Telnyx expects a TeXML response for call.initiated webhook
-  reply.type('text/xml').send(texml);
+  reply.type('text/xml').send(twiml);
 });
 
 // ── Route 2: Bidirectional media stream (Telnyx <-> OpenAI Realtime) ─────────
@@ -225,7 +204,7 @@ Confirm the full order including toppings and total, then call the place_order f
     if (msg.event === 'start') {
       streamSid = msg.start.streamSid;
       // Telnyx sends call_control_id in the start event — use as callSid
-      callSid = msg.start.callControlId ?? msg.start.callSid ?? null;
+      callSid = msg.start.callSid ?? null;
       app.log.info({ callSid, streamSid }, 'Stream started — callSid confirmed');
 
       if (callSid && !calls.has(callSid)) {
