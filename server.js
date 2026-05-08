@@ -199,24 +199,36 @@ Confirm the full order including toppings and total, then call the place_order f
   });
 
   telnyxWs.on('message', (raw) => {
-    const msg = JSON.parse(raw);
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+
+    app.log.info({ event: msg.event }, 'Twilio WS event received');
+
+    if (msg.event === 'connected') {
+      app.log.info('Twilio stream connected event received');
+    }
 
     if (msg.event === 'start') {
       streamSid = msg.start.streamSid;
-      // Telnyx sends call_control_id in the start event — use as callSid
-      callSid = msg.start.callSid ?? null;
+      callSid   = msg.start.callSid ?? null;
       app.log.info({ callSid, streamSid }, 'Stream started — callSid confirmed');
 
       if (callSid && !calls.has(callSid)) {
-        app.log.warn({ callSid }, 'callSid not in map — call may have arrived out of order');
+        app.log.warn({ callSid }, 'callSid not in map — registering now');
+        calls.set(callSid, { callerPhone: null, order: null, charged: false });
       }
     }
 
     if (msg.event === 'media') {
-      openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: msg.media.payload }));
+      if (openaiWs.readyState === WebSocket.OPEN) {
+        openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: msg.media.payload }));
+      }
     }
 
-    if (msg.event === 'stop') openaiWs.close();
+    if (msg.event === 'stop') {
+      app.log.info('Twilio stream stop — closing OpenAI WS');
+      openaiWs.close();
+    }
   });
 
   telnyxWs.on('close', () => { openaiWs.close(); });
