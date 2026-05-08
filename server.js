@@ -119,7 +119,8 @@ app.post('/incoming-call', async (req, reply) => {
 // ── Route 2: Bidirectional media stream (Telnyx <-> OpenAI Realtime) ─────────
 // Telnyx media streaming uses the same WebSocket protocol as Twilio.
 // No changes needed here except the stream event field names (same as Twilio).
-app.get('/media-stream', { websocket: true }, (telnyxWs, req) => {
+app.get('/media-stream', { websocket: true }, (connection, req) => {
+  const telnyxWs = connection.socket;
   app.log.info('Media stream connected — waiting for start event');
 
   const SESSION_CONFIG = {
