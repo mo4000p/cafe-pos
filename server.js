@@ -2,49 +2,46 @@ import Fastify from 'fastify';
 import fastifyFormBody from '@fastify/formbody';
 import fastifyWs from '@fastify/websocket';
 import Stripe from 'stripe';
-import twilio from 'twilio';
 import WebSocket from 'ws';
 import 'dotenv/config';
 
 const {
   OPENAI_API_KEY,
   STRIPE_SECRET_KEY,
-  TWILIO_ACCOUNT_SID,
-  TWILIO_AUTH_TOKEN,
-  TWILIO_FROM_NUMBER,
+  TELNYX_API_KEY,
+  TELNYX_FROM_NUMBER,
   SENDGRID_API_KEY,
   PORT = 3000,
   HOST = '0.0.0.0',
 } = process.env;
 
 const stripe = new Stripe(STRIPE_SECRET_KEY);
-const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
 const MENU = [
-  { name: 'Small Pizza',          price: 10 },
-  { name: 'Medium Pizza',         price: 10 },
-  { name: 'Large Pizza',          price: 10 },
-  { name: 'One Pizza Family Deal',price: 10 },
-  { name: 'Two Pizza Family Deal',price: 10 },
-  { name: 'Small Coke',           price: 10 },
-  { name: 'Medium Coke',          price: 10 },
-  { name: 'Large Coke',           price: 10 },
-  { name: 'Small Sprite',         price: 10 },
-  { name: 'Medium Sprite',        price: 10 },
-  { name: 'Large Sprite',         price: 10 },
-  { name: 'Small Mountain Dew',   price: 10 },
-  { name: 'Medium Mountain Dew',  price: 10 },
-  { name: 'Large Mountain Dew',   price: 10 },
-  { name: 'House Salad',          price: 10 },
-  { name: 'Extra Dressing',       price: 10 },
-  { name: 'Extra Cheese',         price: 10 },
-  { name: 'Pepperoni',            price: 10 },
-  { name: 'Sausage',              price: 10 },
-  { name: 'Onion',                price: 10 },
-  { name: 'Mushroom',             price: 10 },
+  { name: 'Small Pizza',           price: 10 },
+  { name: 'Medium Pizza',          price: 10 },
+  { name: 'Large Pizza',           price: 10 },
+  { name: 'One Pizza Family Deal',  price: 10 },
+  { name: 'Two Pizza Family Deal',  price: 10 },
+  { name: 'Small Coke',            price: 10 },
+  { name: 'Medium Coke',           price: 10 },
+  { name: 'Large Coke',            price: 10 },
+  { name: 'Small Sprite',          price: 10 },
+  { name: 'Medium Sprite',         price: 10 },
+  { name: 'Large Sprite',          price: 10 },
+  { name: 'Small Mountain Dew',    price: 10 },
+  { name: 'Medium Mountain Dew',   price: 10 },
+  { name: 'Large Mountain Dew',    price: 10 },
+  { name: 'House Salad',           price: 10 },
+  { name: 'Extra Dressing',        price: 10 },
+  { name: 'Extra Cheese',          price: 10 },
+  { name: 'Pepperoni',             price: 10 },
+  { name: 'Sausage',               price: 10 },
+  { name: 'Onion',                 price: 10 },
+  { name: 'Mushroom',              price: 10 },
 ];
 
-const MENU_TEXT = MENU.map(i => `${i.name} $${(i.price/100).toFixed(2)}`).join(', ');
+const MENU_TEXT = MENU.map(i => `${i.name} $${(i.price / 100).toFixed(2)}`).join(', ');
 const calls = new Map();
 
 // ── Store hours ───────────────────────────────────────────────────────────────
@@ -64,41 +61,87 @@ function isStoreOpen() {
   return nowMinutes >= openHour * 60 && nowMinutes < closeHour * 60;
 }
 
+// ── Telnyx SMS helper ─────────────────────────────────────────────────────────
+async function sendTelnyxSms(to, body) {
+  const response = await fetch('https://api.telnyx.com/v2/messages', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${TELNYX_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: TELNYX_FROM_NUMBER,
+      to,
+      text: body,
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Telnyx SMS failed: ${err}`);
+  }
+}
+
 const app = Fastify({ logger: true });
 await app.register(fastifyFormBody);
 await app.register(fastifyWs);
 
-// Route 1: Twilio calls this when the phone rings
+// ── Route 1: Telnyx calls this when the phone rings ──────────────────────────
+// In your Telnyx Mission Control portal, set the webhook URL to:
+//   https://cafe-pos-production-d0bd.up.railway.app/incoming-call
+// Telnyx sends JSON (not form-encoded) for call.initiated events.
 app.post('/incoming-call', async (req, reply) => {
-  const callSid     = req.body.CallSid;
-  const callerPhone = req.body.From;
-  app.log.info({ callSid, callerPhone }, 'Incoming call');
+  const body = req.body;
+
+  // Telnyx wraps everything in a "data" object
+  const event = body?.data;
+  const callControlId = event?.payload?.call_control_id;
+  const callerPhone   = event?.payload?.from;
+  const callSid       = callControlId; // use call_control_id as our internal key
+
+  app.log.info({ callControlId, callerPhone }, 'Incoming call');
 
   if (!isStoreOpen()) {
-    app.log.info({ callSid }, 'Store closed — rejecting call');
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="Polly.Joanna">Sorry, we are currently closed. Our hours are 7 AM to 10 PM daily. Please call back during business hours. Goodbye!</Say>
-  <Hangup/>
-</Response>`;
-    return reply.type('text/xml').send(twiml);
+    app.log.info({ callControlId }, 'Store closed — hanging up');
+
+    // Tell Telnyx to speak and hang up via Call Control API
+    await fetch(`https://api.telnyx.com/v2/calls/${callControlId}/actions/speak`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${TELNYX_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        payload: 'Sorry, we are currently closed. Our hours are 7 AM to 10 PM daily. Please call back during business hours. Goodbye!',
+        voice: 'female',
+        language: 'en-US',
+        command_id: 'closed-msg',
+      }),
+    });
+
+    return reply.code(200).send({ message: 'ok' });
   }
 
   calls.set(callSid, { callerPhone, order: null, charged: false });
 
-  const host = req.headers.host;
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+  const host = `cafe-pos-production-d0bd.up.railway.app`;
+
+  // Telnyx TeXML — identical structure to TwiML
+  const texml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <Stream url="wss://${host}/media-stream" />
   </Connect>
 </Response>`;
-  reply.type('text/xml').send(twiml);
+
+  // Telnyx expects a TeXML response for call.initiated webhook
+  reply.type('text/xml').send(texml);
 });
 
-// Route 2: Bidirectional media stream (Twilio <-> OpenAI Realtime)
-app.get('/media-stream', { websocket: true }, (twilioWs, req) => {
-  app.log.info('Media stream connected — waiting for start event to get callSid');
+// ── Route 2: Bidirectional media stream (Telnyx <-> OpenAI Realtime) ─────────
+// Telnyx media streaming uses the same WebSocket protocol as Twilio.
+// No changes needed here except the stream event field names (same as Twilio).
+app.get('/media-stream', { websocket: true }, (telnyxWs, req) => {
+  app.log.info('Media stream connected — waiting for start event');
 
   const SESSION_CONFIG = {
     model: 'gpt-4o-realtime-preview',
@@ -157,14 +200,16 @@ Confirm the full order including toppings and total, then call the place_order f
 
   openaiWs.on('message', async (raw) => {
     const event = JSON.parse(raw);
+
     if (event.type === 'response.audio.delta' && event.delta) {
-      twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: event.delta } }));
+      telnyxWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: event.delta } }));
     }
+
     if (event.type === 'response.function_call_arguments.done' && event.name === 'place_order') {
-      const args = JSON.parse(event.arguments);
+      const args      = JSON.parse(event.arguments);
       const callState = calls.get(callSid);
       if (callState) callState.order = args;
-      const callerPhone = callState ? callState.callerPhone : null;
+      const callerPhone = callState?.callerPhone ?? null;
       const result = await chargePhone(callerPhone, callSid, args);
       openaiWs.send(JSON.stringify({
         type: 'conversation.item.create',
@@ -174,12 +219,13 @@ Confirm the full order including toppings and total, then call the place_order f
     }
   });
 
-  twilioWs.on('message', (raw) => {
+  telnyxWs.on('message', (raw) => {
     const msg = JSON.parse(raw);
 
     if (msg.event === 'start') {
       streamSid = msg.start.streamSid;
-      callSid   = msg.start.callSid;
+      // Telnyx sends call_control_id in the start event — use as callSid
+      callSid = msg.start.callControlId ?? msg.start.callSid ?? null;
       app.log.info({ callSid, streamSid }, 'Stream started — callSid confirmed');
 
       if (callSid && !calls.has(callSid)) {
@@ -190,43 +236,17 @@ Confirm the full order including toppings and total, then call the place_order f
     if (msg.event === 'media') {
       openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: msg.media.payload }));
     }
+
     if (msg.event === 'stop') openaiWs.close();
   });
 
-  twilioWs.on('close', () => { openaiWs.close(); });
+  telnyxWs.on('close', () => { openaiWs.close(); });
 });
 
-// Route 3: Called from Twilio Function after order is spoken
-app.post('/charge', async (req, reply) => {
-  const { callerPhone, callSid, items, total_cents } = req.body;
-  app.log.info({ callerPhone, total_cents }, 'Charge request from Twilio Function');
-  const result = await chargePhone(callerPhone, callSid, { items: items || [], total_cents });
-  reply.send(result);
-});
-
-// Route 4: Called from Twilio Pay after card is collected
-app.post('/charge-token', async (req, reply) => {
-  const { token, order, amount } = req.body;
-  app.log.info({ amount }, 'Charge token request');
-
-  try {
-    app.log.info({ token }, 'Payment confirmed by Twilio Pay');
-
-    // order may arrive as a JSON string or already-parsed object
-    const orderData = typeof order === 'string' ? JSON.parse(order) : order;
-
-    await sendKitchenEmail(orderData, token, 'Phone order');
-    reply.send({ success: true, charged: `$${(orderData.total_cents / 100).toFixed(2)}` });
-  } catch (err) {
-    app.log.error({ err: err.message }, 'Kitchen email failed');
-    reply.send({ success: false, error: err.message });
-  }
-});
-
-// Health check
+// ── Route 3: Health check ─────────────────────────────────────────────────────
 app.get('/health', async () => ({ status: 'ok', calls: calls.size }));
 
-// Stripe charge by phone number
+// ── Stripe charge by phone number ─────────────────────────────────────────────
 async function chargePhone(phone, callSid, order) {
   if (!phone) return { success: false, error: 'No phone number provided' };
   try {
@@ -253,14 +273,14 @@ async function chargePhone(phone, callSid, order) {
     const pm = paymentMethods.data[0];
 
     const intent = await stripe.paymentIntents.create({
-      amount: order.total_cents,
-      currency: 'usd',
-      customer: customer.id,
+      amount:         order.total_cents,
+      currency:       'usd',
+      customer:       customer.id,
       payment_method: pm.id,
-      confirm: true,
-      off_session: true,
-      description: `Pizza order — ${(order.items||[]).map(i => `${i.name}x${i.quantity}`).join(', ')}`,
-      metadata: { callSid: callSid || 'unknown', source: 'twilio-voice-bot' },
+      confirm:        true,
+      off_session:    true,
+      description:    `Pizza order — ${(order.items || []).map(i => `${i.name}x${i.quantity}`).join(', ')}`,
+      metadata:       { callSid: callSid || 'unknown', source: 'telnyx-voice-bot' },
     });
 
     app.log.info({ phone, intentId: intent.id }, 'Payment charged');
@@ -268,9 +288,9 @@ async function chargePhone(phone, callSid, order) {
     await sendSmsReceipt(phone, order, intent.id);
 
     return {
-      success: true,
-      charged: `$${(order.total_cents / 100).toFixed(2)}`,
-      last4: pm.card.last4,
+      success:   true,
+      charged:   `$${(order.total_cents / 100).toFixed(2)}`,
+      last4:     pm.card.last4,
       receiptId: intent.id,
     };
   } catch (err) {
@@ -279,7 +299,7 @@ async function chargePhone(phone, callSid, order) {
   }
 }
 
-// Email to kitchen via SendGrid
+// ── Kitchen email via SendGrid ─────────────────────────────────────────────────
 async function sendKitchenEmail(order, intentId, phone) {
   const itemRows = (order.items || [])
     .map(i => `
@@ -289,7 +309,7 @@ async function sendKitchenEmail(order, intentId, phone) {
       </tr>`)
     .join('');
 
-  const ref = String(intentId).slice(-8).toUpperCase();
+  const ref   = String(intentId).slice(-8).toUpperCase();
   const total = `$${(order.total_cents / 100).toFixed(2)}`;
 
   const htmlBody = `
@@ -325,7 +345,7 @@ async function sendKitchenEmail(order, intentId, phone) {
 </body>
 </html>`;
 
-  const plainBody = `NEW PIZZA ORDER\n\n${(order.items||[]).map(i => `${i.quantity}x ${i.name} — $${((i.price*i.quantity)/100).toFixed(2)}`).join('\n')}\n\nTotal: ${total}\nPhone: ${phone}\nRef: ${ref}`;
+  const plainBody = `NEW PIZZA ORDER\n\n${(order.items || []).map(i => `${i.quantity}x ${i.name} — $${((i.price * i.quantity) / 100).toFixed(2)}`).join('\n')}\n\nTotal: ${total}\nPhone: ${phone}\nRef: ${ref}`;
 
   try {
     const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
@@ -336,9 +356,9 @@ async function sendKitchenEmail(order, intentId, phone) {
       },
       body: JSON.stringify({
         personalizations: [{ to: [{ email: 'mo40000p@gmail.com' }] }],
-        from: { email: 'orders@svoice.shop', name: 'Pizza Orders' },
+        from:     { email: 'orders@svoice.shop', name: 'Pizza Orders' },
         reply_to: { email: 'mo40000p@gmail.com' },
-        subject: `🍕 New Pizza Order — ${total}`,
+        subject:  `🍕 New Pizza Order — ${total}`,
         content: [
           { type: 'text/plain', value: plainBody },
           { type: 'text/html',  value: htmlBody },
@@ -357,9 +377,9 @@ async function sendKitchenEmail(order, intentId, phone) {
   }
 }
 
-// SMS receipt to customer
+// ── SMS receipt to customer via Telnyx ────────────────────────────────────────
 async function sendSmsReceipt(to, order, intentId) {
-  const lines = (order.items||[]).map(i =>
+  const lines = (order.items || []).map(i =>
     `  ${i.name} x${i.quantity}  $${((i.price * i.quantity) / 100).toFixed(2)}`
   );
   const body = [
@@ -368,9 +388,10 @@ async function sendSmsReceipt(to, order, intentId) {
     `Total: $${(order.total_cents / 100).toFixed(2)}`,
     `Ref: ${intentId.slice(-8).toUpperCase()}`,
   ].join('\n');
+
   try {
-    await twilioClient.messages.create({ to, from: TWILIO_FROM_NUMBER, body });
-    app.log.info({ to }, 'SMS receipt sent');
+    await sendTelnyxSms(to, body);
+    app.log.info({ to }, 'SMS receipt sent via Telnyx');
   } catch (err) {
     app.log.error({ err: err.message }, 'SMS receipt failed');
   }
