@@ -203,7 +203,12 @@ Confirm the full order including toppings and total, then call the place_order f
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
-    app.log.info({ event: msg.event }, 'Twilio WS event received');
+    // Log full message for non-media events so we can debug
+    if (msg.event !== 'media') {
+      app.log.info({ fullMsg: JSON.stringify(msg) }, 'Twilio WS non-media event');
+    } else {
+      app.log.info({ event: msg.event }, 'Twilio WS event received');
+    }
 
     if (msg.event === 'connected') {
       app.log.info('Twilio stream connected event received');
@@ -218,9 +223,20 @@ Confirm the full order including toppings and total, then call the place_order f
         app.log.warn({ callSid }, 'callSid not in map — registering now');
         calls.set(callSid, { callerPhone: null, order: null, charged: false });
       }
+
+      // Trigger OpenAI to greet the caller now that stream is ready
+      if (openaiWs.readyState === WebSocket.OPEN) {
+        openaiWs.send(JSON.stringify({ type: 'response.create' }));
+        app.log.info('Sent response.create to OpenAI to trigger greeting');
+      }
     }
 
     if (msg.event === 'media') {
+      // Fallback: grab streamSid from media event if start event never arrived
+      if (!streamSid) {
+        streamSid = msg.streamSid ?? null;
+        if (streamSid) app.log.warn({ streamSid }, 'streamSid set from media event — start event missed');
+      }
       if (openaiWs.readyState === WebSocket.OPEN) {
         openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: msg.media.payload }));
       }
