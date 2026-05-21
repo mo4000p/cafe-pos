@@ -3,41 +3,18 @@ import WebSocket from "ws";
 import dotenv from "dotenv";
 import fastifyFormBody from "@fastify/formbody";
 import fastifyWs from "@fastify/websocket";
-import pkg from "pg";
-
 dotenv.config();
 
-const { Pool } = pkg;
-const { OPENAI_API_KEY, DATABASE_URL } = process.env;
+const { OPENAI_API_KEY } = process.env;
 
 if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
-if (!DATABASE_URL) throw new Error("Missing DATABASE_URL");
 
-// ── Postgres ────────────────────────────────────────────────────────────────
-const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
-
-async function initDb() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS sophia_leads (
-      id            SERIAL PRIMARY KEY,
-      call_sid      TEXT,
-      caller_phone  TEXT,
-      name          TEXT,
-      address       TEXT,
-      wants_pictures BOOLEAN,
-      wants_date    BOOLEAN,
-      created_at    TIMESTAMPTZ DEFAULT NOW()
-    )
-  `);
-  console.log("DB ready ✓");
-}
+// ── In-memory lead store (logged to console) ────────────────────────────────
+const leads = [];
 
 async function saveLead(data) {
-  await pool.query(
-    `INSERT INTO sophia_leads (call_sid, caller_phone, name, address, wants_pictures, wants_date)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [data.callSid, data.callerPhone, data.name, data.address, data.wantsPictures, data.wantsDate]
-  );
+  leads.push({ ...data, createdAt: new Date().toISOString() });
+  console.log("NEW LEAD 💋", JSON.stringify(data, null, 2));
 }
 
 // ── Sophia system prompt ────────────────────────────────────────────────────
@@ -237,15 +214,11 @@ fastify.register(async (fastify) => {
 
 // ── Admin: view leads ───────────────────────────────────────────────────────
 fastify.get("/leads", async (_, reply) => {
-  const result = await pool.query(
-    "SELECT * FROM sophia_leads ORDER BY created_at DESC LIMIT 100"
-  );
-  return result.rows;
+  return leads;
 });
 
 // ── Start ───────────────────────────────────────────────────────────────────
 try {
-  await initDb();
   await fastify.listen({ port: PORT, host: "0.0.0.0" });
   console.log(`Sophia listening on port ${PORT} 💋`);
 } catch (err) {
