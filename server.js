@@ -85,11 +85,10 @@ fastify.register(async (fastify) => {
     // ── Open OpenAI Realtime connection ──
     function connectToOpenAI() {
       openAiWs = new WebSocket(
-        wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview
+        "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
         {
           headers: {
             Authorization: `Bearer ${OPENAI_API_KEY}`,
-
           },
         }
       );
