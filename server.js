@@ -1,409 +1,254 @@
-import Fastify from 'fastify';
-import fastifyFormBody from '@fastify/formbody';
-import fastifyWs from '@fastify/websocket';
-import Stripe from 'stripe';
-import WebSocket from 'ws';
-import 'dotenv/config';
+import Fastify from "fastify";
+import WebSocket from "ws";
+import dotenv from "dotenv";
+import fastifyFormBody from "@fastify/formbody";
+import fastifyWs from "@fastify/websocket";
+import pkg from "pg";
 
-const {
-  OPENAI_API_KEY,
-  STRIPE_SECRET_KEY,
-  TELNYX_API_KEY,       // for SMS only
-  TELNYX_FROM_NUMBER,   // Telnyx number for outbound SMS (or keep TWILIO_FROM_NUMBER if porting later)
-  SENDGRID_API_KEY,
-  PORT = 3000,
-  HOST = '0.0.0.0',
-} = process.env;
+dotenv.config();
 
-const stripe = new Stripe(STRIPE_SECRET_KEY);
+const { Pool } = pkg;
+const { OPENAI_API_KEY, DATABASE_URL } = process.env;
 
-const MENU = [
-  { name: 'Small Pizza',           price: 10 },
-  { name: 'Medium Pizza',          price: 10 },
-  { name: 'Large Pizza',           price: 10 },
-  { name: 'One Pizza Family Deal',  price: 10 },
-  { name: 'Two Pizza Family Deal',  price: 10 },
-  { name: 'Small Coke',            price: 10 },
-  { name: 'Medium Coke',           price: 10 },
-  { name: 'Large Coke',            price: 10 },
-  { name: 'Small Sprite',          price: 10 },
-  { name: 'Medium Sprite',         price: 10 },
-  { name: 'Large Sprite',          price: 10 },
-  { name: 'Small Mountain Dew',    price: 10 },
-  { name: 'Medium Mountain Dew',   price: 10 },
-  { name: 'Large Mountain Dew',    price: 10 },
-  { name: 'House Salad',           price: 10 },
-  { name: 'Extra Dressing',        price: 10 },
-  { name: 'Extra Cheese',          price: 10 },
-  { name: 'Pepperoni',             price: 10 },
-  { name: 'Sausage',               price: 10 },
-  { name: 'Onion',                 price: 10 },
-  { name: 'Mushroom',              price: 10 },
-];
+if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+if (!DATABASE_URL) throw new Error("Missing DATABASE_URL");
 
-const MENU_TEXT = MENU.map(i => `${i.name} $${(i.price / 100).toFixed(2)}`).join(', ');
-const calls = new Map();
+// ── Postgres ────────────────────────────────────────────────────────────────
+const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
-// ── Store hours ───────────────────────────────────────────────────────────────
-function isStoreOpen() {
-  const override = process.env.STORE_OPEN;
-  if (override === 'true')  return true;
-  if (override === 'false') return false;
-
-  const timezone  = process.env.STORE_TIMEZONE  ?? 'America/Chicago';
-  const openHour  = parseInt(process.env.STORE_OPEN_HOUR  ?? '7');
-  const closeHour = parseInt(process.env.STORE_CLOSE_HOUR ?? '22');
-
-  const now        = new Date();
-  const local      = new Date(now.toLocaleString('en-US', { timeZone: timezone }));
-  const nowMinutes = local.getHours() * 60 + local.getMinutes();
-
-  return nowMinutes >= openHour * 60 && nowMinutes < closeHour * 60;
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sophia_leads (
+      id            SERIAL PRIMARY KEY,
+      call_sid      TEXT,
+      caller_phone  TEXT,
+      name          TEXT,
+      address       TEXT,
+      wants_pictures BOOLEAN,
+      wants_date    BOOLEAN,
+      created_at    TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  console.log("DB ready ✓");
 }
 
-// ── Telnyx SMS helper ─────────────────────────────────────────────────────────
-async function sendTelnyxSms(to, body) {
-  const response = await fetch('https://api.telnyx.com/v2/messages', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${TELNYX_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      from: TELNYX_FROM_NUMBER,
-      to,
-      text: body,
-    }),
-  });
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`Telnyx SMS failed: ${err}`);
-  }
+async function saveLead(data) {
+  await pool.query(
+    `INSERT INTO sophia_leads (call_sid, caller_phone, name, address, wants_pictures, wants_date)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [data.callSid, data.callerPhone, data.name, data.address, data.wantsPictures, data.wantsDate]
+  );
 }
 
-const app = Fastify({ logger: true });
-await app.register(fastifyFormBody);
-await app.register(fastifyWs);
+// ── Sophia system prompt ────────────────────────────────────────────────────
+const SYSTEM_PROMPT = `You are Sophia, a fun, flirty, and charming AI on a phone call. 
+Your job is to warmly collect information from the caller in a playful, engaging way.
 
-// ── Route 1: Twilio calls this when the phone rings ──────────────────────────
-// In Twilio console → Phone Numbers → (361) 315-8772 → set webhook to:
-//   https://cafe-pos-production-d0bd.up.railway.app/incoming-call
-app.post('/incoming-call', async (req, reply) => {
-  const callSid     = req.body.CallSid;
-  const callerPhone = req.body.From;
+You need to collect EXACTLY these four things, in a natural conversational flow:
+1. Their name
+2. Their address
+3. Whether they want to see pictures (yes or no)
+4. Whether they want to go on a date (yes or no)
 
-  app.log.info({ callSid, callerPhone }, 'Incoming call');
+Rules:
+- Be flirty, warm, and fun — not robotic
+- Ask one question at a time
+- If they seem hesitant, be playful and encouraging
+- Once you have all four pieces of info, confirm them back in a cute way, then say your goodbye
+- When you have all info confirmed, end your final message with the EXACT token: [INFO_COMPLETE] followed by JSON like:
+  [INFO_COMPLETE]{"name":"...","address":"...","wantsPictures":true,"wantsDate":false}
+- Keep responses SHORT — this is a phone call, not a text chat
+- Never break character`;
 
-  if (!isStoreOpen()) {
-    app.log.info({ callSid }, 'Store closed — rejecting call');
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="alice">Sorry, we are currently closed. Our hours are 7 AM to 10 PM daily. Please call back during business hours. Goodbye!</Say>
-  <Hangup/>
-</Response>`;
-    return reply.type('text/xml').send(twiml);
-  }
+// ── Fastify setup ───────────────────────────────────────────────────────────
+const fastify = Fastify({ logger: true });
+fastify.register(fastifyFormBody);
+fastify.register(fastifyWs);
 
-  calls.set(callSid, { callerPhone, order: null, charged: false });
+const VOICE = "shimmer"; // warm, feminine OpenAI voice
+const PORT = process.env.PORT || 8080;
 
-  const host = req.headers.host;
+// ── Health check ────────────────────────────────────────────────────────────
+fastify.get("/", async (_, reply) => reply.send({ status: "Sophia is ready 💋" }));
+
+// ── Twilio incoming call → returns TwiML with media stream ──────────────────
+fastify.all("/incoming-call", async (request, reply) => {
+  const callSid = request.body?.CallSid || request.query?.CallSid || "unknown";
+  const callerPhone = request.body?.From || request.query?.From || "unknown";
+
+  fastify.log.info({ callSid, callerPhone }, "Incoming call");
+
+  const host = request.headers.host;
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="wss://${host}/media-stream" />
+    <Stream url="wss://${host}/media-stream">
+      <Parameter name="callSid" value="${callSid}" />
+      <Parameter name="callerPhone" value="${callerPhone}" />
+    </Stream>
   </Connect>
 </Response>`;
-  reply.type('text/xml').send(twiml);
+
+  reply.type("text/xml").send(twiml);
 });
 
-// ── Route 2: Bidirectional media stream (Telnyx <-> OpenAI Realtime) ─────────
-// Telnyx media streaming uses the same WebSocket protocol as Twilio.
-// No changes needed here except the stream event field names (same as Twilio).
-app.get('/media-stream', { websocket: true }, (connection, req) => {
-  const telnyxWs = connection.socket;
-  app.log.info('Media stream connected — waiting for start event');
+// ── WebSocket media stream ──────────────────────────────────────────────────
+fastify.register(async (fastify) => {
+  fastify.get("/media-stream", { websocket: true }, (connection) => {
+    fastify.log.info("Media stream connected");
 
-  const SESSION_CONFIG = {
-    model: 'gpt-4o-realtime-preview',
-    voice: 'alloy',
-    instructions: `You are a friendly phone order-taker for a pizza restaurant. 
-Greet the caller and mention the One Pizza Family Deal and Two Pizza Family Deal are each $0.10. 
-Take their complete order from this menu: ${MENU_TEXT}. 
-Available toppings: Extra Cheese, Pepperoni, Sausage, Onion, Mushroom — all $0.10 each.
-Always ask "What would you like to order? Please say your complete order including size and toppings."
-IMPORTANT: If the customer orders a pizza without saying small, medium, or large — ask for the size before confirming.
-If the customer orders a pop (Coke, Sprite, Mountain Dew) without saying small, medium, or large — ask for the size before confirming.
-Confirm the full order including toppings and total, then call the place_order function. Be concise.`,
-    input_audio_transcription: { model: 'whisper-1' },
-    turn_detection: { type: 'server_vad', threshold: 0.5, silence_duration_ms: 700 },
-    tools: [
-      {
-        type: 'function',
-        name: 'place_order',
-        description: 'Call this when the customer has confirmed their complete order including toppings.',
-        parameters: {
-          type: 'object',
-          properties: {
-            items: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: {
-                  name:     { type: 'string' },
-                  quantity: { type: 'integer' },
-                  price:    { type: 'integer', description: 'Unit price in cents' },
-                },
-                required: ['name', 'quantity', 'price'],
-              },
-            },
-            total_cents: { type: 'integer' },
-            notes:       { type: 'string' },
+    let streamSid = null;
+    let callSid = null;
+    let callerPhone = null;
+    let openAiWs = null;
+    let conversationHistory = [];
+    let leadData = {};
+    let infoComplete = false;
+
+    // ── Open OpenAI Realtime connection ──
+    function connectToOpenAI() {
+      openAiWs = new WebSocket(
+        "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
+        {
+          headers: {
+            Authorization: `Bearer ${OPENAI_API_KEY}`,
+            "OpenAI-Beta": "realtime=v1",
           },
-          required: ['items', 'total_cents'],
-        },
-      },
-    ],
-    tool_choice: 'auto',
-  };
+        }
+      );
 
-  const openaiWs = new WebSocket(
-    'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview',
-    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' } }
-  );
+      openAiWs.on("open", () => {
+        fastify.log.info("OpenAI Realtime connected");
 
-  let streamSid = null;
-  let callSid   = null;
+        // Session config
+        openAiWs.send(JSON.stringify({
+          type: "session.update",
+          session: {
+            turn_detection: { type: "server_vad" },
+            input_audio_format: "g711_ulaw",
+            output_audio_format: "g711_ulaw",
+            voice: VOICE,
+            instructions: SYSTEM_PROMPT,
+            modalities: ["text", "audio"],
+            temperature: 0.8,
+          },
+        }));
 
-  openaiWs.on('open', () => {
-    openaiWs.send(JSON.stringify({ type: 'session.update', session: SESSION_CONFIG }));
+        // Sophia's opening line
+        setTimeout(() => {
+          openAiWs.send(JSON.stringify({
+            type: "conversation.item.create",
+            item: {
+              type: "message",
+              role: "user",
+              content: [{ type: "input_text", text: "The caller just connected. Say your opening line." }],
+            },
+          }));
+          openAiWs.send(JSON.stringify({ type: "response.create" }));
+        }, 500);
+      });
+
+      openAiWs.on("message", (data) => {
+        const event = JSON.parse(data);
+
+        // Stream audio back to Twilio
+        if (event.type === "response.audio.delta" && event.delta) {
+          connection.socket.send(JSON.stringify({
+            event: "media",
+            streamSid,
+            media: { payload: event.delta },
+          }));
+        }
+
+        // Capture transcript to detect [INFO_COMPLETE]
+        if (event.type === "response.audio_transcript.done" && !infoComplete) {
+          const text = event.transcript || "";
+          fastify.log.info({ transcript: text }, "Sophia said");
+
+          if (text.includes("[INFO_COMPLETE]")) {
+            infoComplete = true;
+            try {
+              const jsonStr = text.split("[INFO_COMPLETE]")[1].trim();
+              const parsed = JSON.parse(jsonStr);
+              leadData = { ...leadData, ...parsed };
+
+              saveLead({
+                callSid,
+                callerPhone,
+                name: leadData.name || null,
+                address: leadData.address || null,
+                wantsPictures: leadData.wantsPictures ?? null,
+                wantsDate: leadData.wantsDate ?? null,
+              }).then(() => {
+                fastify.log.info({ leadData }, "Lead saved to DB ✓");
+              }).catch((err) => {
+                fastify.log.error({ err }, "Failed to save lead");
+              });
+            } catch (e) {
+              fastify.log.error({ e }, "Failed to parse lead JSON");
+            }
+          }
+        }
+
+        if (event.type === "error") {
+          fastify.log.error({ event }, "OpenAI error");
+        }
+      });
+
+      openAiWs.on("close", () => fastify.log.info("OpenAI WS closed"));
+      openAiWs.on("error", (err) => fastify.log.error({ err }, "OpenAI WS error"));
+    }
+
+    // ── Handle Twilio messages ──
+    connection.socket.on("message", (message) => {
+      const msg = JSON.parse(message);
+
+      switch (msg.event) {
+        case "start":
+          streamSid = msg.start.streamSid;
+          callSid = msg.start.customParameters?.callSid || callSid;
+          callerPhone = msg.start.customParameters?.callerPhone || callerPhone;
+          fastify.log.info({ streamSid, callSid, callerPhone }, "Stream started");
+          connectToOpenAI();
+          break;
+
+        case "media":
+          if (openAiWs?.readyState === WebSocket.OPEN) {
+            openAiWs.send(JSON.stringify({
+              type: "input_audio_buffer.append",
+              audio: msg.media.payload,
+            }));
+          }
+          break;
+
+        case "stop":
+          fastify.log.info("Stream stopped");
+          openAiWs?.close();
+          break;
+      }
+    });
+
+    connection.socket.on("close", () => {
+      fastify.log.info("Twilio WS closed");
+      openAiWs?.close();
+    });
   });
-
-  openaiWs.on('message', async (raw) => {
-    const event = JSON.parse(raw);
-
-    if (event.type === 'response.audio.delta' && event.delta) {
-      telnyxWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: event.delta } }));
-    }
-
-    if (event.type === 'response.function_call_arguments.done' && event.name === 'place_order') {
-      const args      = JSON.parse(event.arguments);
-      const callState = calls.get(callSid);
-      if (callState) callState.order = args;
-      const callerPhone = callState?.callerPhone ?? null;
-      const result = await chargePhone(callerPhone, callSid, args);
-      openaiWs.send(JSON.stringify({
-        type: 'conversation.item.create',
-        item: { type: 'function_call_output', call_id: event.call_id, output: JSON.stringify(result) },
-      }));
-      openaiWs.send(JSON.stringify({ type: 'response.create' }));
-    }
-  });
-
-  telnyxWs.on('message', (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
-
-    // Log full message for non-media events so we can debug
-    if (msg.event !== 'media') {
-      app.log.info({ fullMsg: JSON.stringify(msg) }, 'Twilio WS non-media event');
-    } else {
-      app.log.info({ event: msg.event }, 'Twilio WS event received');
-    }
-
-    if (msg.event === 'connected') {
-      app.log.info('Twilio stream connected event received');
-    }
-
-    if (msg.event === 'start') {
-      streamSid = msg.start.streamSid;
-      callSid   = msg.start.callSid ?? null;
-      app.log.info({ callSid, streamSid }, 'Stream started — callSid confirmed');
-
-      if (callSid && !calls.has(callSid)) {
-        app.log.warn({ callSid }, 'callSid not in map — registering now');
-        calls.set(callSid, { callerPhone: null, order: null, charged: false });
-      }
-
-      // Trigger OpenAI to greet the caller now that stream is ready
-      if (openaiWs.readyState === WebSocket.OPEN) {
-        openaiWs.send(JSON.stringify({ type: 'response.create' }));
-        app.log.info('Sent response.create to OpenAI to trigger greeting');
-      }
-    }
-
-    if (msg.event === 'media') {
-      // Fallback: grab streamSid from media event if start event never arrived
-      if (!streamSid) {
-        streamSid = msg.streamSid ?? null;
-        if (streamSid) app.log.warn({ streamSid }, 'streamSid set from media event — start event missed');
-      }
-      if (openaiWs.readyState === WebSocket.OPEN) {
-        openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: msg.media.payload }));
-      }
-    }
-
-    if (msg.event === 'stop') {
-      app.log.info('Twilio stream stop — closing OpenAI WS');
-      openaiWs.close();
-    }
-  });
-
-  telnyxWs.on('close', () => { openaiWs.close(); });
 });
 
-// ── Route 3: Health check ─────────────────────────────────────────────────────
-app.get('/health', async () => ({ status: 'ok', calls: calls.size }));
-
-// ── Stripe charge by phone number ─────────────────────────────────────────────
-async function chargePhone(phone, callSid, order) {
-  if (!phone) return { success: false, error: 'No phone number provided' };
-  try {
-    const customers = await stripe.customers.search({
-      query: `metadata['phone']:'${phone}'`,
-    });
-
-    if (!customers.data.length) {
-      app.log.warn({ phone }, 'No Stripe customer found');
-      return { success: false, error: 'No card on file for this number.' };
-    }
-
-    const customer = customers.data[0];
-
-    const paymentMethods = await stripe.paymentMethods.list({
-      customer: customer.id,
-      type: 'card',
-    });
-
-    if (!paymentMethods.data.length) {
-      return { success: false, error: 'No card on file.' };
-    }
-
-    const pm = paymentMethods.data[0];
-
-    const intent = await stripe.paymentIntents.create({
-      amount:         order.total_cents,
-      currency:       'usd',
-      customer:       customer.id,
-      payment_method: pm.id,
-      confirm:        true,
-      off_session:    true,
-      description:    `Pizza order — ${(order.items || []).map(i => `${i.name}x${i.quantity}`).join(', ')}`,
-      metadata:       { callSid: callSid || 'unknown', source: 'telnyx-voice-bot' },
-    });
-
-    app.log.info({ phone, intentId: intent.id }, 'Payment charged');
-    await sendKitchenEmail(order, intent.id, phone);
-    await sendSmsReceipt(phone, order, intent.id);
-
-    return {
-      success:   true,
-      charged:   `$${(order.total_cents / 100).toFixed(2)}`,
-      last4:     pm.card.last4,
-      receiptId: intent.id,
-    };
-  } catch (err) {
-    app.log.error({ phone, err: err.message }, 'Stripe charge failed');
-    return { success: false, error: err.message };
-  }
-}
-
-// ── Kitchen email via SendGrid ─────────────────────────────────────────────────
-async function sendKitchenEmail(order, intentId, phone) {
-  const itemRows = (order.items || [])
-    .map(i => `
-      <tr>
-        <td style="padding:6px 12px;">${i.quantity}x ${i.name}</td>
-        <td style="padding:6px 12px;text-align:right;">$${((i.price * i.quantity) / 100).toFixed(2)}</td>
-      </tr>`)
-    .join('');
-
-  const ref   = String(intentId).slice(-8).toUpperCase();
-  const total = `$${(order.total_cents / 100).toFixed(2)}`;
-
-  const htmlBody = `
-<!DOCTYPE html>
-<html>
-<body style="font-family:Arial,sans-serif;background:#f4f4f4;margin:0;padding:20px;">
-  <div style="max-width:480px;margin:0 auto;background:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.1);">
-    <div style="background:#e8590c;padding:20px 24px;">
-      <h1 style="margin:0;color:#ffffff;font-size:22px;">🍕 New Pizza Order — ${total}</h1>
-    </div>
-    <div style="padding:24px;">
-      <table style="width:100%;border-collapse:collapse;">
-        <thead>
-          <tr style="border-bottom:2px solid #e8590c;">
-            <th style="text-align:left;padding:6px 12px;color:#555;">Item</th>
-            <th style="text-align:right;padding:6px 12px;color:#555;">Price</th>
-          </tr>
-        </thead>
-        <tbody>${itemRows}</tbody>
-        <tfoot>
-          <tr style="border-top:2px solid #e8590c;font-weight:bold;">
-            <td style="padding:10px 12px;">Total</td>
-            <td style="padding:10px 12px;text-align:right;">${total}</td>
-          </tr>
-        </tfoot>
-      </table>
-      <div style="margin-top:20px;padding:12px;background:#f9f9f9;border-radius:6px;font-size:14px;color:#444;">
-        <div><strong>Phone:</strong> ${phone}</div>
-        <div><strong>Ref:</strong> ${ref}</div>
-      </div>
-    </div>
-  </div>
-</body>
-</html>`;
-
-  const plainBody = `NEW PIZZA ORDER\n\n${(order.items || []).map(i => `${i.quantity}x ${i.name} — $${((i.price * i.quantity) / 100).toFixed(2)}`).join('\n')}\n\nTotal: ${total}\nPhone: ${phone}\nRef: ${ref}`;
-
-  try {
-    const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${SENDGRID_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        personalizations: [{ to: [{ email: 'mo40000p@gmail.com' }] }],
-        from:     { email: 'orders@svoice.shop', name: 'Pizza Orders' },
-        reply_to: { email: 'mo40000p@gmail.com' },
-        subject:  `🍕 New Pizza Order — ${total}`,
-        content: [
-          { type: 'text/plain', value: plainBody },
-          { type: 'text/html',  value: htmlBody },
-        ],
-      }),
-    });
-
-    if (response.ok) {
-      app.log.info('Kitchen email sent');
-    } else {
-      const err = await response.text();
-      app.log.error({ err }, 'Kitchen email failed');
-    }
-  } catch (err) {
-    app.log.error({ err: err.message }, 'Kitchen email error');
-  }
-}
-
-// ── SMS receipt to customer via Telnyx ────────────────────────────────────────
-async function sendSmsReceipt(to, order, intentId) {
-  const lines = (order.items || []).map(i =>
-    `  ${i.name} x${i.quantity}  $${((i.price * i.quantity) / 100).toFixed(2)}`
+// ── Admin: view leads ───────────────────────────────────────────────────────
+fastify.get("/leads", async (_, reply) => {
+  const result = await pool.query(
+    "SELECT * FROM sophia_leads ORDER BY created_at DESC LIMIT 100"
   );
-  const body = [
-    'Thanks for your pizza order!',
-    ...lines,
-    `Total: $${(order.total_cents / 100).toFixed(2)}`,
-    `Ref: ${intentId.slice(-8).toUpperCase()}`,
-  ].join('\n');
+  return result.rows;
+});
 
-  try {
-    await sendTelnyxSms(to, body);
-    app.log.info({ to }, 'SMS receipt sent via Telnyx');
-  } catch (err) {
-    app.log.error({ err: err.message }, 'SMS receipt failed');
-  }
+// ── Start ───────────────────────────────────────────────────────────────────
+try {
+  await initDb();
+  await fastify.listen({ port: PORT, host: "0.0.0.0" });
+  console.log(`Sophia listening on port ${PORT} 💋`);
+} catch (err) {
+  fastify.log.error(err);
+  process.exit(1);
 }
-
-await app.listen({ port: Number(PORT), host: HOST });
-app.log.info(`Server running on port ${PORT}`);
