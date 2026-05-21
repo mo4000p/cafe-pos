@@ -8,11 +8,9 @@
   },
   "dependencies": {
     "@fastify/formbody": "^7.4.0",
-    "@fastify/websocket": "^8.3.0",
     "dotenv": "^16.4.5",
     "fastify": "^4.27.0",
-    "stripe": "^15.7.0",
-    "twilio": "^5.2.0",
-    "ws": "^8.17.0"
+    "node-fetch": "^3.3.2",
+    "openai": "^4.47.0"
   }
 }
