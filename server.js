@@ -1,24 +1,30 @@
 import Fastify from "fastify";
-import WebSocket from "ws";
 import dotenv from "dotenv";
 import fastifyFormBody from "@fastify/formbody";
-import fastifyWs from "@fastify/websocket";
+import OpenAI from "openai";
+import fetch from "node-fetch";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import { execSync } from "child_process";
+
 dotenv.config();
 
 const { OPENAI_API_KEY } = process.env;
-
 if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
 
-// ── In-memory lead store (logged to console) ────────────────────────────────
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const TMP = "/tmp";
+
+// ── In-memory lead store ─────────────────────────────────────────────────────
 const leads = [];
 
-async function saveLead(data) {
-  leads.push({ ...data, createdAt: new Date().toISOString() });
-  console.log("NEW LEAD 💋", JSON.stringify(data, null, 2));
-}
+// ── Conversation store (keyed by CallSid) ────────────────────────────────────
+const conversations = {};
 
-// ── Sophia system prompt ────────────────────────────────────────────────────
-const SYSTEM_PROMPT = `You are Sophia, a fun, flirty, and charming AI on a phone call. 
+// ── Sophia system prompt ──────────────────────────────────────────────────────
+const SYSTEM_PROMPT = `You are Sophia, a fun, flirty, and charming AI on a phone call.
 Your job is to warmly collect information from the caller in a playful, engaging way.
 
 You need to collect EXACTLY these four things, in a natural conversational flow:
@@ -30,193 +36,139 @@ You need to collect EXACTLY these four things, in a natural conversational flow:
 Rules:
 - Be flirty, warm, and fun — not robotic
 - Ask one question at a time
+- Keep responses SHORT — this is a phone call, 1-2 sentences max
 - If they seem hesitant, be playful and encouraging
-- Once you have all four pieces of info, confirm them back in a cute way, then say your goodbye
-- When you have all info confirmed, end your final message with the EXACT token: [INFO_COMPLETE] followed by JSON like:
-  [INFO_COMPLETE]{"name":"...","address":"...","wantsPictures":true,"wantsDate":false}
-- Keep responses SHORT — this is a phone call, not a text chat
+- Once you have all four pieces of info, confirm them back cutely then say goodbye
+- When you have confirmed all info, end your response with exactly: [DONE]
 - Never break character`;
 
-// ── Fastify setup ───────────────────────────────────────────────────────────
+// ── Fastify setup ─────────────────────────────────────────────────────────────
 const fastify = Fastify({ logger: true });
 fastify.register(fastifyFormBody);
-fastify.register(fastifyWs);
 
-const VOICE = "shimmer"; // warm, feminine OpenAI voice
 const PORT = process.env.PORT || 8080;
 
-// ── Health check ────────────────────────────────────────────────────────────
+// ── Health check ──────────────────────────────────────────────────────────────
 fastify.get("/", async (_, reply) => reply.send({ status: "Sophia is ready 💋" }));
 
-// ── Twilio incoming call → returns TwiML with media stream ──────────────────
+// ── Helper: text → speech MP3 via OpenAI TTS ─────────────────────────────────
+async function textToSpeech(text, filename) {
+  const mp3 = await openai.audio.speech.create({
+    model: "tts-1",
+    voice: "shimmer",
+    input: text,
+  });
+  const buffer = Buffer.from(await mp3.arrayBuffer());
+  const filepath = path.join(TMP, filename);
+  fs.writeFileSync(filepath, buffer);
+  return filepath;
+}
+
+// ── Helper: convert MP3 to mulaw 8khz WAV for Twilio ─────────────────────────
+function convertToMulaw(inputPath, outputPath) {
+  execSync(`ffmpeg -y -i ${inputPath} -ar 8000 -ac 1 -f mulaw ${outputPath}`);
+  return outputPath;
+}
+
+// ── Helper: get Sophia's reply from GPT-4o ───────────────────────────────────
+async function getSophiaReply(callSid, userMessage) {
+  if (!conversations[callSid]) {
+    conversations[callSid] = [];
+  }
+
+  if (userMessage) {
+    conversations[callSid].push({ role: "user", content: userMessage });
+  }
+
+  const response = await openai.chat.completions.create({
+    model: "gpt-4o",
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      ...conversations[callSid],
+    ],
+    max_tokens: 150,
+    temperature: 0.9,
+  });
+
+  const reply = response.choices[0].message.content;
+  conversations[callSid].push({ role: "assistant", content: reply });
+
+  // Check if done and save lead
+  if (reply.includes("[DONE]")) {
+    const cleanReply = reply.replace("[DONE]", "").trim();
+    const history = conversations[callSid];
+    leads.push({
+      callSid,
+      history,
+      createdAt: new Date().toISOString(),
+    });
+    console.log("NEW LEAD 💋 CallSid:", callSid);
+    delete conversations[callSid];
+    return cleanReply;
+  }
+
+  return reply;
+}
+
+// ── /incoming-call — greeting ─────────────────────────────────────────────────
 fastify.all("/incoming-call", async (request, reply) => {
-  const callSid = request.body?.CallSid || request.query?.CallSid || "unknown";
-  const callerPhone = request.body?.From || request.query?.From || "unknown";
+  const callSid = request.body?.CallSid || "unknown";
+  fastify.log.info({ callSid }, "Incoming call");
 
-  fastify.log.info({ callSid, callerPhone }, "Incoming call");
+  const greeting = "Hey there, I'm Sophia... and I've been waiting for your call.";
+  
+  // Prime conversation
+  conversations[callSid] = [
+    { role: "assistant", content: greeting }
+  ];
 
-  const host = request.headers.host;
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Connect>
-    <Stream url="wss://${host}/media-stream">
-      <Parameter name="callSid" value="${callSid}" />
-      <Parameter name="callerPhone" value="${callerPhone}" />
-    </Stream>
-  </Connect>
+  <Say voice="Polly.Joanna-Neural">${greeting}</Say>
+  <Gather input="speech" action="/respond" method="POST" speechTimeout="auto" speechModel="phone_call" enhanced="true">
+  </Gather>
 </Response>`;
 
   reply.type("text/xml").send(twiml);
 });
 
-// ── WebSocket media stream ──────────────────────────────────────────────────
-fastify.register(async (fastify) => {
-  fastify.get("/media-stream", { websocket: true }, (connection) => {
-    fastify.log.info("Media stream connected");
+// ── /respond — handle speech input ───────────────────────────────────────────
+fastify.post("/respond", async (request, reply) => {
+  const callSid = request.body?.CallSid || "unknown";
+  const speechResult = request.body?.SpeechResult || "";
 
-    let streamSid = null;
-    let callSid = null;
-    let callerPhone = null;
-    let openAiWs = null;
-    let conversationHistory = [];
-    let leadData = {};
-    let infoComplete = false;
+  fastify.log.info({ callSid, speechResult }, "User said");
 
-    // ── Open OpenAI Realtime connection ──
-    function connectToOpenAI() {
-      openAiWs = new WebSocket(
-        "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17",
-        {
-          headers: {
-            Authorization: `Bearer ${OPENAI_API_KEY}`,
-          },
-        }
-      );
+  let sophiaReply;
+  try {
+    sophiaReply = await getSophiaReply(callSid, speechResult);
+  } catch (err) {
+    fastify.log.error({ err }, "GPT error");
+    sophiaReply = "Sorry, I got a little distracted thinking about you. Say that again?";
+  }
 
-      openAiWs.on("open", () => {
-        fastify.log.info("OpenAI Realtime connected");
+  const isDone = !conversations[callSid];
 
-        // Session config
-        openAiWs.send(JSON.stringify({
-          type: "session.update",
-          session: {
-            turn_detection: { type: "server_vad" },
-            input_audio_format: "g711_ulaw",
-            output_audio_format: "g711_ulaw",
-            voice: VOICE,
-            instructions: SYSTEM_PROMPT,
-            modalities: ["text", "audio"],
-            temperature: 0.8,
-          },
-        }));
+  const twiml = isDone
+    ? `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Joanna-Neural">${sophiaReply}</Say>
+  <Hangup/>
+</Response>`
+    : `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Joanna-Neural">${sophiaReply}</Say>
+  <Gather input="speech" action="/respond" method="POST" speechTimeout="auto" speechModel="phone_call" enhanced="true">
+  </Gather>
+</Response>`;
 
-        // Sophia's opening line
-        setTimeout(() => {
-          openAiWs.send(JSON.stringify({
-            type: "conversation.item.create",
-            item: {
-              type: "message",
-              role: "user",
-              content: [{ type: "input_text", text: "The caller just connected. Say your opening line." }],
-            },
-          }));
-          openAiWs.send(JSON.stringify({ type: "response.create" }));
-        }, 500);
-      });
-
-      openAiWs.on("message", (data) => {
-        const event = JSON.parse(data);
-
-        // Stream audio back to Twilio
-        if (event.type === "response.audio.delta" && event.delta) {
-          connection.socket.send(JSON.stringify({
-            event: "media",
-            streamSid,
-            media: { payload: event.delta },
-          }));
-        }
-
-        // Capture transcript to detect [INFO_COMPLETE]
-        if (event.type === "response.audio_transcript.done" && !infoComplete) {
-          const text = event.transcript || "";
-          fastify.log.info({ transcript: text }, "Sophia said");
-
-          if (text.includes("[INFO_COMPLETE]")) {
-            infoComplete = true;
-            try {
-              const jsonStr = text.split("[INFO_COMPLETE]")[1].trim();
-              const parsed = JSON.parse(jsonStr);
-              leadData = { ...leadData, ...parsed };
-
-              saveLead({
-                callSid,
-                callerPhone,
-                name: leadData.name || null,
-                address: leadData.address || null,
-                wantsPictures: leadData.wantsPictures ?? null,
-                wantsDate: leadData.wantsDate ?? null,
-              }).then(() => {
-                fastify.log.info({ leadData }, "Lead saved to DB ✓");
-              }).catch((err) => {
-                fastify.log.error({ err }, "Failed to save lead");
-              });
-            } catch (e) {
-              fastify.log.error({ e }, "Failed to parse lead JSON");
-            }
-          }
-        }
-
-        if (event.type === "error") {
-          fastify.log.error({ event }, "OpenAI error");
-        }
-      });
-
-      openAiWs.on("close", () => fastify.log.info("OpenAI WS closed"));
-      openAiWs.on("error", (err) => fastify.log.error({ err }, "OpenAI WS error"));
-    }
-
-    // ── Handle Twilio messages ──
-    connection.socket.on("message", (message) => {
-      const msg = JSON.parse(message);
-
-      switch (msg.event) {
-        case "start":
-          streamSid = msg.start.streamSid;
-          callSid = msg.start.customParameters?.callSid || callSid;
-          callerPhone = msg.start.customParameters?.callerPhone || callerPhone;
-          fastify.log.info({ streamSid, callSid, callerPhone }, "Stream started");
-          connectToOpenAI();
-          break;
-
-        case "media":
-          if (openAiWs?.readyState === WebSocket.OPEN) {
-            openAiWs.send(JSON.stringify({
-              type: "input_audio_buffer.append",
-              audio: msg.media.payload,
-            }));
-          }
-          break;
-
-        case "stop":
-          fastify.log.info("Stream stopped");
-          openAiWs?.close();
-          break;
-      }
-    });
-
-    connection.socket.on("close", () => {
-      fastify.log.info("Twilio WS closed");
-      openAiWs?.close();
-    });
-  });
+  reply.type("text/xml").send(twiml);
 });
 
-// ── Admin: view leads ───────────────────────────────────────────────────────
-fastify.get("/leads", async (_, reply) => {
-  return leads;
-});
+// ── /leads — view collected leads ────────────────────────────────────────────
+fastify.get("/leads", async (_, reply) => reply.send(leads));
 
-// ── Start ───────────────────────────────────────────────────────────────────
+// ── Start ─────────────────────────────────────────────────────────────────────
 try {
   await fastify.listen({ port: PORT, host: "0.0.0.0" });
   console.log(`Sophia listening on port ${PORT} 💋`);
